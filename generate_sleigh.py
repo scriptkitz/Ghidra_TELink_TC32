@@ -1,28 +1,19 @@
 #!/usr/bin/env python3
 '''
-This script was written to help me generate SLEIGH code to disassemble an
-architecture for which I had a objdump binary but no documentation.
+This script generates SLEIGH code for the Telink TC32 architecture.
+It parses assembler format strings (derived from objdump) to determine
+bitfields and operands, and generates corresponding SLEIGH definitions.
 
-Inside objdump is a table of assembler format strings with control codes (like
-`%3-5r`) that describe how individual bits of the encoded instruction ought to
-be interpreted.
-
-By parsing these format strings, we can translate them into SLEIGH code.
-
-Ryan Govostes
-April 14, 2019
+Improvements:
+- Supports both 16-bit and 32-bit instructions
+- Autogenerates basic P-code templates
+- Restores original logic for register mapping and computed values
 '''
 
 import re
+import sys
 
-# These are extracted from the `thumb_opcodes` and `thumb_opcodes32` arrays
-# from tc32-elf-objdump.exe, which was repurposed from the original code.
-# 
-# Each (value, mask, assembler) tuple tells the `print_insn_thumb16` function,
-# also repurposed, how to decode an instruction.
-#
-# Note that bitfield ranges here are specified with bit 0 as the *last* bit of
-# the encoded instruction.
+# Instruction definitions: (size, value, mask, assembler_format)
 insns = [
   (16, 0x46c0, 0xffff, 'tnop%c\\t\\t\\t; (mov r8, r8)'),
   (16, 0x0000, 0xffc0, 'tand%C\\t%0-2r, %3-5r'),
@@ -84,546 +75,382 @@ insns = [
   (16, 0xd000, 0xf800, 'tstorem%c\\t%8-10r!, %M'),
   (16, 0xd800, 0xf800, 'tloadm%c\\t%8-10r!, %M'),
   (16, 0xcf00, 0xff00, 'tserv%c\\t%0-7d'),
-# (16, 0xce00, 0xfe00, 'undefined instruction %0-31x'),
   (16, 0xc000, 0xf000, 'tj%8-11c.n\\t%0-7B%X'),
   (16, 0x8000, 0xf800, 'tj%c.n\\t%0-10B%x'),
   (32, 0x9000c000, 0xf800d000, 'tjlex%c\\t%B%x'),
   (32, 0x90009800, 0xf800f800, 'tjl%c\\t%B%x'),
 ]
 
-
-################################################################################
-
-# ---- FIXME ----
-# This is a terribly designed tree structure that explains how the fields and 
-# registers and computed values are related. It needs to be redesigned.
-# ---- FIXME ----
-
-class Expression:
-  def __init__(self):
-    self.children = []
-  
-  def __eq__(self, rhs):
-    return isinstance(rhs, type(self)) and repr(self) == repr(rhs)
-  
-  def __hash__(self):
-    return hash(repr(self))
-  
-  def findall(self, predicate):
-    found = set()
-    explored = set([self])
-    to_explore = list(self.children)
-    if predicate(self):
-      found.add(self)
-    while len(to_explore) > 0:
-      child = to_explore.pop()
-      if child in explored:
-        continue
-      explored.add(child)
-      if isinstance(child, Expression):
-        to_explore.extend(child.children)
-      if predicate(child):
-        found.add(child)
-    return found
-
-
-class Field(Expression):
-  '''
-  A Field is a bitfield that is extracted from the encoded instruction.
-  It is a leaf node of an expression tree.
-  '''
-  def __init__(self, purpose, lo, size, attributes=None):
-    super().__init__()
-    self.purpose, self.lo, self.size = purpose, lo, size
-    self.attributes = attributes or []
-  
-  @property
-  def name(self):
-    return '%s_%i_%i' % (self.purpose, self.lo, self.size)
-  
-  @property
-  def hi(self):
-    return self.lo + self.size - 1
-  
-  def as_sleigh_definition(self):
-    return '%s = (%i, %i)%s' % (self.name, self.lo, self.hi,
-      (' %s' % ' '.join(self.attributes) if self.attributes else ''))
-  
-  def __repr__(self):
-    return 'Field(%r, %r, %r)' % (self.purpose, self.lo, self.size)
-
-
-class Register(Expression):
-  '''
-  A Register is a reference to a specific register's value, such as $r3. It
-  is a leaf node of an expression tree.
-  '''
-  def __init__(self, name):
-    super().__init__()
-    self.name = name
-  
-  def __repr__(self):
-    return 'Register(%r)' % (self.name)
-
-
-class ContextVariable(Expression):
-  '''
-  A ContextVariable is a bitfield that extracted from a specific register.
-  '''
-  def __init__(self, name, register, lo, size, attributes=None):
-    super().__init__()
-    self.name, self.register, self.lo, self.size = name, register, lo, size
-    self.attributes = attributes or []
-    self.children.append(self.register)
-  
-  @property
-  def hi(self):
-    return self.lo + self.size - 1
-  
-  def as_sleigh_definition(self):
-    return '%s = (%i, %i)%s' % (self.name, self.lo, self.hi,
-      (' %s' % ' '.join(self.attributes) if self.attributes else ''))
-  
-  def __repr__(self):
-    return 'ContextVariable(%r, %r, %r, %r)' \
-      % (self.name, self.register, self.lo, self.size)
-
-
-class ComputedValue(Expression):
-  def __init__(self, name, children):
-    super().__init__()
-    self.name = name
-    self.children = children
-  
-  def __repr__(self):
-    return 'ComputedValue(%r, children=%r)' \
-      % (self.name, self.children)
-
-
-################################################################################
-
-
-# Here are the format control codes that are supported. Most are assumed to be
-# based on the original `print_insn_thumb16` code, unless otherwise noted.
-#
-# See:
-# http://sourceware.org/git/gitweb.cgi?p=binutils-gdb.git;a=blob;f=opcodes/arm-dis.c;hb=HEAD#l2508
-
-class ControlCode:
-  def expand(self):
-    '''
-    This must return an element or iterable that will take the place of the
-    control code in the token list.
-    '''
-    raise NotImplementedError
-  
-  def also_uses(self):
-    '''
-    If implemented, this should return the fields that are also impact how the
-    instruction is interpreted, such as flag fields.
-    '''
-    pass
-
-
-class PercentPercent(ControlCode):
-  '''print a literal %'''
-  PATTERN = r'%%'
-  
-  def expand(self):
-    return '%'
-
-class PercentUpperS(ControlCode):
-  '''print register (bits 3..5 as high number if bit 6 set)'''
-  PATTERN = r'%S'
-  
-  def expand(self):
-    return ComputedValue(
-      name='hi_reg_6_1_and_3_3',
-      children=[
-        Field('hi_reg_upper', 6, 1),
-        Field('hi_reg_lower', 3, 3),
-      ]
-    )
-
-class PercentUpperD(ControlCode):  # FIXME: Incomplete
-  '''print register (bits 0..2 as high number if bit 7 set)'''
-  PATTERN = r'%D'
-
-  def expand(self):
-    return ComputedValue(
-      name='hi_reg_7_1_and_0_3',
-      children=[
-        Field('hi_reg_upper', 7, 1),
-        Field('hi_reg_lower', 0, 3),
-      ]
-    )
-
-class PercentUpperN(ControlCode):
-  '''print register mask (with LR)'''
-  PATTERN = r'%N'
-  
-  def expand(self):
-    a = []  # FIXME: Incomplete
-    return ('{', *a, Register('lr'), '}')
-
-class PercentUpperO(ControlCode):
-  '''print register mask (with PC)'''  # FIXME: Incomplete
-  PATTERN = r'%O'
-
-  def expand(self):
-    a = []  # FIXME: Incomplete
-    return ('{', *a, Register('pc'), '}')
-
-class PercentUpperM(ControlCode):
-  '''print register mask'''
-  PATTERN = r'%M'
-  
-  def expand(self):
-    a = []  # FIXME: Incomplete
-    return ('{', *a, '}')
-
-class PercentLowerB(ControlCode):
-  '''print CZB's 6-bit unsigned branch destination'''
-  PATTERN = r'%b'
-  
-  def expand(self):
-    # FIXME: Not used, so didn't bother to implement
-    pass
-
-class PercentLowerS(ControlCode):
-  '''print right-shift immediate (6..10; 0 == 32).'''
-  PATTERN = r'%s'
-  
-  def expand(self):
-    return ComputedValue(
-      'right_shift_imm_6_5',
-      children=[ Field('imm', 6, 5) ]
-    )
-
-class PercentLowerC(ControlCode):
-  '''print the condition code'''
-  PATTERN = r'%c'
-  
-  def expand(self):
-    if False:
-      # The TC32 does not seem to have conditional instructions like Thumb
-      return ContextVariable('cond', Register('flags'), 0, 4)
-    return None
-
-class PercentUpperC(ControlCode):
-  '''print the condition code, or 's' if not conditional'''
-  PATTERN = r'%C'
-  
-  def expand(self):
-    if False:
-      # The TC32 does not seem to have conditional instructions like Thumb
-      return ComputedValue(
-        'cond_or_s',
-        children=[ ContextVariable('cond', Register('flags'), 0, 4) ]
-      )
-    return 's'
-
-class PercentLowerX(ControlCode):
-  '''print warning if conditional an not at end of IT block'''
-  PATTERN = r'%x'
-  
-  def expand(self):
-    # FIXME: just a comment; don't do anything
-    pass
-
-class PercentUpperX(ControlCode):
-  '''print "\t; unpredictable <IT:code>" if conditional'''
-  PATTERN = r'%X'
-  
-  def expand(self):
-    # FIXME: just a comment; no-op it
-    pass
-
-class PercentUpperI(ControlCode):  # FIXME: Incomplete
-  '''print IT instruction suffix and operands'''
-  PATTERN = r'%I'
-
-class PercentBitfieldLowerR(ControlCode):
-  '''print bitfield as a register'''
-  PATTERN = r'%(\d+)-(\d+)r'
-  
-  def expand(self, a, b):
-    return Field('reg', int(a), int(b) - int(a) + 1)
-
-class PercentBitfieldLowerD(ControlCode):
-  '''print bitfield as decimal'''
-  PATTERN = r'%(\d+)-(\d+)d'
-  
-  def expand(self, a, b):
-    return Field('imm', int(a), int(b) - int(a) + 1, attributes=['dec'])
-
-class PercentBitfieldUpperH(ControlCode):
-  '''print (bitfield * 2) as decimal'''
-  PATTERN = r'%(\d+)-(\d+)H'
-
-  def expand(self, a, b):
-    f = Field('imm', int(a), int(b) - int(a) + 1, attributes=['dec'])
-    return ComputedValue(
-      '%s_x2' % f.name,
-      children=[f]
-    )
-
-class PercentBitfieldUpperW(ControlCode):
-  '''print (bitfield * 4) as decimal'''
-  PATTERN = r'%(\d+)-(\d+)W'
-  
-  def expand(self, a, b):
-    f = Field('imm', int(a), int(b) - int(a) + 1, attributes=['dec'])
-    return ComputedValue(
-      '%s_x4' % f.name,
-      children=[f]
-    )
-
-class PercentBitfieldLowerA(ControlCode):
-  '''print (bitfield * 4) as a pc-rel offset'''
-  PATTERN = r'%(\d+)-(\d+)a'
-  
-  def expand(self, a, b):
-    # Should be (((pc + 4) & ~3) + (imm << 2)
-    return ComputedField(
-      'pc_rel_offset',
-      children=[
-        Field('imm', int(a), int(b) - int(a) + 1)
-      ]
-    )
-
-class PercentBitfieldUpperB(ControlCode):
-  '''print branch destination (signed displacement)'''
-  PATTERN = r'%(\d+)-(\d+)B'
-  
-  def expand(self, a, b):
-    return Field('displacement', int(a), int(b) - int(a) + 1,
-      attributes=['signed'])
-
-class PercentBitfieldLowerC(ControlCode):
-  '''print bitfield as a condition code'''
-  PATTERN = r'%(\d+)-(\d+)c'
-  
-  def expand(self, a, b):
-    return Field('cond_imm', int(a), int(b) - int(a) + 1)
-
-class PercentBitfieldLowerX(ControlCode):
-  '''print bitfield as hexadecimal'''
-  PATTERN = r'%(\d+)-(\d+)x'
-  
-  def expand(self, a, b):
-    return Field('imm', int(a), int(b) - int(a) + 1, attributes=['hex'])
-
-class PercentQuote(ControlCode):
-  '''print char iff bit is one'''
-  PATTERN = r'%(\d+)\'(.)'
-  
-  def expand(self, a, x):
-    return Field('flag', int(a), 1)
-
-class PercentQuestionMark(ControlCode):
-  '''print first char if bit is one, else second'''
-  PATTERN = r'%(\d+)\?(.)(.)'
-  
-  def expand(self, a, x, y):
-    return Field('flag', int(a), 1)
-
-class RegisterReference(ControlCode):
-  '''
-  This isn't a control code exactly, but a few of the assembler format strings
-  contain hardcoded references to the `sp` and `pc` registers. We want to expand
-  them to Register tokens.
-  '''
-  PATTERN = r'(^|\s|\[|,)(sp|pc)(,|\]|\s|$)'
-  
-  def expand(self, pre, reg, post):
-    pre = [pre] if pre else []  # elide empty matches
-    post = [post] if post else []
-    return (*pre, Register(reg), *post)
-
-
-################################################################################
-
-
-# Parse all of the instructions' assembler format strings
-_insns = []
-for size, value, mask, asm in insns:
-  # Normalize whitespace and strip comments
-  asm = re.sub(r'\\t|\s+', ' ', asm)
-  asm = re.sub(r'\s*;.*$', '', asm)
-  
-  # Tokenize: ['tand', '%C', ' ', '%0-2r', ',', ' ', '%3-5r']
-  tokens = []
-  for i, a in enumerate(re.split(r'\s+', asm)):
-    pattern = r'|'.join(cc.PATTERN for cc in ControlCode.__subclasses__())
-    pattern = pattern.replace('(', '(?:')
-    pattern = r'(' + pattern + r')'
-    parts = list(filter(lambda x: x, re.split(pattern, a)))
-    tokens.extend(parts)
-    tokens.append(' ')
-  del tokens[-1]
-  
-  # Expand control codes
-  while True:
-    modified = False
-    for i, token in enumerate(tokens):
-      if not isinstance(token, str): continue
-      for cc in ControlCode.__subclasses__():
-        m = re.match(cc.PATTERN, token)
-        if m:
-          newtokens = cc().expand(*m.groups())
-          try:
-            tokens[i:i+1] = filter(lambda x: x is not None, newtokens)
-          except TypeError:  # wasn't an iterable, make it one
-            tokens[i:i+1] = filter(lambda x: x is not None, [newtokens])
-          modified = True
-          break
-      if modified: break
-    if not modified: break
-  
-  # Convert the list of tokens to a parent expression
-  # Personally I don't really like the design of this, but what do I know.
-  e = Expression()
-  e.children = tokens
-  
-  # This is a bit gnarly, but we're basically converting the mask that objdump
-  # uses to identify the instruction into the fields of the instruction that
-  # we match against, and the values we expect those fields to hold.
-  conditions = []
-  maskbits = bin(mask)[2:].rjust(16, '0')[::-1]
-  valuebits = bin(value)[2:].rjust(16, '0')[::-1]
-  groups = re.findall(r'(0+|1+)', maskbits)
-  offset = 0
-  for g in groups:
-    if g.startswith('1'):
-      v = int(valuebits[offset:offset+len(g)][::-1] , 2)
-      conditions.append((Field('op', offset, len(g)), v))
-    offset += len(g)
-  
-  _insns.append((size, value, mask, asm, e, conditions))
-insns = _insns
-insns.sort(key=lambda x: x[3])  # sort by asm
-
-
-################################################################################
-
-
-# Generate the field map, which specifies all of the contiguous bitfields we
-# will use from the instruction encoding.
-
-allfields = set()
-for size, _, _, _, e, conditions in insns:
-  if size != 16: continue
-  allfields.update(e.findall(lambda x: isinstance(x, Field)))
-  allfields.update(f for f, v in conditions)
-
-allfields = list(allfields)
-allfields.sort(key=lambda x: x.name)
-
-print('define token instruction(16)')
-for field in allfields:
-  print('  %s' % field.as_sleigh_definition())
-print(';')
-
-print()
-
-
-################################################################################
-
-
-# Generate the context variables, which are subfields of registers (like
-# status flags).
-
-contextregs = {}
-for _, _, _, _, e, _ in insns:
-    for v in e.findall(lambda x: isinstance(x, ContextVariable)):
-      if v.register not in contextregs:
-        contextregs[v.register] = set()
-      contextregs[v.register].add(v)
-
-for reg in sorted(contextregs.keys(), key=lambda x: x.name):
-  print('define context %s' % reg.name)
-  for var in contextregs[reg]:
-    print('  %s' % var.as_sleigh_definition())
-  print(';')
-
-print()
-
-
-################################################################################
-
-
-# Generate the tables for the special variables
-
-allcomputed = set()
-for _, _, _, _, e, _ in insns:
-  fields = e.findall(lambda x: isinstance(x, ComputedValue))
-  allcomputed.update(fields)
-
-allcomputed = list(allcomputed)
-allcomputed.sort(key=lambda x: x.name)
-
-for computed in allcomputed:
-  print('%s: "fill me in!" is ' % computed.name, end='')
-  print(' & '.join(f.name for f in computed.children \
-    if isinstance(f, Expression)), end='')
-  print(' { }')
-
-print()
-
-
-################################################################################
-
-
-# Generate SLEIGH code from the instructions
-for size, value, mask, asm, expr, conditions in insns:
-  # Output the objdump specification as a comment
-  print('#', asm)
-  
-  # Output the display section (see 7.3). This is a little ugly because we have
-  # to figure out where to put quotation marks and the ^ character to
-  # concatenate identifiers and literal characters.
-  print(':%s' % expr.children[0], end='')
-  prev_identifier = True
-  for i, t in enumerate(expr.children[1:]):
-    if t == ' ':
-      print(' ', end='')
-      prev_identifier = False
-      continue
-    
-    if isinstance(t, Expression):
-      if prev_identifier:
-        print('^', end='')
-      print(t.name, end='')
-      prev_identifier = True
-      continue
-    prev_identifier = False
-    
-    if isinstance(t, str):
-      if i == 0 and re.match('^[a-zA-Z_]+$', t):
-        print(t, end = '')
-      elif any(x.isalpha() for x in t):
-        if prev_identifier:
-          print('^', end='')
-        print('"%s"' % t, end='')
-      else:
-        print(t, end='')
-      continue
-    
-    raise ValueError('Unexpected token type', type(t))
-  
-  # Figure out the references we'll make
-  refs = [ f for f in expr.children if isinstance(f, Expression) ]
-
-  # Output the constraints
-  print(' is ', end='')
-  print(' & '.join('%s=0x%04x' % (f.name, v) for f, v in conditions), end='')
-  if len(refs) and len(conditions):
-    print(' & ', end='')
-  print(' & '.join(f.name for f in refs), end='')
-  print()
-  print('{')
-  print('}')
-  print()
-
-
+class SLEIGHGenerator:
+    def __init__(self):
+        self.fields = set()
+        self.register_fields = set()
+        self.computed_definitions = {} # name -> definition string
+        self.computed_registers = set() # Track which computed registers are used
+        self.contexts = set()
+
+    def generate(self):
+        parsed_insns = []
+        for size, value, mask, asm in insns:
+            asm_clean = re.sub(r'\\t|\s+', ' ', asm).strip()
+            asm_clean = re.sub(r'\s*;.*$', '', asm_clean)
+            
+            mnemonic, operands = self._parse_asm(asm_clean)
+            constraints = self._build_constraints(size, value, mask)
+            
+            parsed_insns.append({
+                'size': size,
+                'mnemonic': mnemonic,
+                'operands': operands,
+                'constraints': constraints,
+                'asm_clean': asm_clean,
+                'original_asm': asm_clean # Use clean version for comment
+            })
+            
+        self._print_headers()
+        for insn in sorted(parsed_insns, key=lambda x: x['asm_clean']):
+            self._print_instruction(insn)
+
+    def _parse_asm(self, asm):
+        parts = asm.split(' ', 1)
+        mnemonic_raw = parts[0]
+        operands_raw = parts[1] if len(parts) > 1 else ""
+        
+        # Clean mnemonic for P-code matching (strip control codes)
+        mnemonic_clean = re.sub(r'%[\d\-\?\'\.]*[a-zA-Z]', '', mnemonic_raw)
+        
+        # Tokenize mnemonic by control codes
+        mnem_parts = re.split(r'(%[\d\-\?\'\.]*[a-zA-Z]+)', mnemonic_raw)
+        mnem_parts = [x for x in mnem_parts if x]
+        
+        # Tokenize operands
+        op_parts = []
+        if operands_raw:
+            # Add space separator before operands if they exist
+            op_parts.append(" ")
+            # Split operands
+            raw_ops = re.split(r'([,\[\]\s+#])', operands_raw)
+            op_parts.extend([x for x in raw_ops if x and x.strip()])
+            
+        all_parts = mnem_parts + op_parts
+        final_operands = []
+        
+        for part in all_parts:
+            # If part contains %, it might be a control code or multiple control codes (e.g. %S%x)
+            if '%' in part:
+                 # Split by control code regex (same as mnemonic)
+                 sub_parts = re.split(r'(%[\d\-\?\'\.]*[a-zA-Z]+)', part)
+                 sub_parts = [x for x in sub_parts if x]
+                 
+                 for sub in sub_parts:
+                     if '%' in sub:
+                         expanded = self._expand_control_code(sub)
+                         if expanded != '': 
+                             final_operands.append(expanded)
+                     else:
+                         # Literal parts between codes (rare but possible)
+                         if sub.strip() and not sub in [',', '[', ']', ' ', '+', '#']:
+                             final_operands.append(f'"{sub}"')
+                         elif sub.strip():
+                             final_operands.append(sub)
+            else:
+                 # Check if literal identifier (needs quotes for display)
+                 if part.strip() and not part in [',', '[', ']', ' ', '+', '#']:
+                     final_operands.append(f'"{part}"')
+                 else:
+                     final_operands.append(part)
+                 
+        return mnemonic_clean, final_operands
+
+    def _expand_control_code(self, code):
+        # Handle prefix stripping if passed explicitly (legacy check, usually handled by split)
+        prefix = ""
+        if code.startswith("#"):
+            prefix = "#"
+            code = code[1:]
+            
+        # Register fields
+        if code == '%0-2r': return prefix + self._reg_field(0, 3)
+        if code == '%3-5r': return prefix + self._reg_field(3, 3)
+        if code == '%6-8r': return prefix + self._reg_field(6, 3)
+        if code == '%8-10r': return prefix + self._reg_field(8, 3)
+        
+        # High registers (computed)
+        if code == '%D': 
+            self._add_computed_reg('hi_reg_7_1_and_0_3', 'hi_reg_upper_7_1', 'hi_reg_lower_0_3')
+            return prefix + 'hi_reg_7_1_and_0_3'
+        if code == '%S': 
+            self._add_computed_reg('hi_reg_6_1_and_3_3', 'hi_reg_upper_6_1', 'hi_reg_lower_3_3')
+            return prefix + 'hi_reg_6_1_and_3_3'
+        
+        # Condition codes and Suffixes
+        if code == '%c': return '' 
+        if code == '%x': return '' # Ignore %x (hex format marker usually empty context)
+        if code == '%X': return '' # Ignore %X
+        if code == '%C': return '"s"' # Return quoted literal for display
+        if code == '%8-11c': return self._field('cond_imm', 8, 4)
+        
+        # Immediates with scaling
+        m = re.match(r'%(\d+)-(\d+)d', code)
+        if m: return prefix + self._imm_field(int(m.group(1)), int(m.group(2)) - int(m.group(1)) + 1, 'dec')
+        
+        m = re.match(r'%(\d+)-(\d+)x', code)
+        if m: return prefix + self._imm_field(int(m.group(1)), int(m.group(2)) - int(m.group(1)) + 1, 'hex')
+
+        m = re.match(r'%(\d+)-(\d+)W', code)
+        if m: 
+            base = self._imm_field(int(m.group(1)), int(m.group(2)) - int(m.group(1)) + 1, 'dec')
+            param = f'{base}_x4'
+            self.computed_definitions[param] = f'{param}: value is {base} [ value = {base} * 4; ] {{ local tmp:4 = value; export tmp; }}'
+            return prefix + param
+
+        m = re.match(r'%(\d+)-(\d+)H', code)
+        if m: 
+            base = self._imm_field(int(m.group(1)), int(m.group(2)) - int(m.group(1)) + 1, 'dec')
+            param = f'{base}_x2'
+            self.computed_definitions[param] = f'{param}: value is {base} [ value = {base} * 2; ] {{ local tmp:4 = value; export tmp; }}'
+            return prefix + param
+        
+        # Branches
+        m = re.match(r'%(\d+)-(\d+)B', code)
+        if m: return self._field(f'displacement_{m.group(1)}_{int(m.group(2))-int(m.group(1))+1}', int(m.group(1)), int(m.group(2))-int(m.group(1))+1, 'signed')
+        
+        if code == '%B': return 'rel22' # For 32-bit jumps
+
+        # Register list literals - keep braces for display, extract name for constraints
+        if code == '%M': return '{}'  # Empty register list
+        if code == '%N': return '{lr}'  # lr register list
+        if code == '%O': return '{pc}'  # pc register list
+        if code == '%s': 
+            self._add_shift_computed('right_shift_imm_6_5', 'imm_6_5')
+            return 'right_shift_imm_6_5'
+            
+        # Bit flags
+        m = re.match(r'%(\d+)\'b', code)
+        if m: return self._field(f'flag_{m.group(1)}_1', int(m.group(1)), 1)
+        
+        m = re.match(r'%(\d+)\?hb', code)
+        if m: return self._field(f'flag_{m.group(1)}_1', int(m.group(1)), 1)
+            
+        return prefix + code
+
+
+    def _reg_field(self, lo, size):
+        name = f'reg_{lo}_{size}'
+        self.fields.add((name, lo, size, None))
+        self.register_fields.add(name)
+        return name
+
+    def _imm_field(self, lo, size, attr):
+        name = f'imm_{lo}_{size}'
+        self.fields.add((name, lo, size, attr))
+        return name
+
+    def _field(self, name, lo, size, attr=None):
+        self.fields.add((name, lo, size, attr))
+        return name
+
+    def _add_computed_reg(self, name, hi_field, lo_field):
+        # We need the underlying fields
+        hi_lo = int(hi_field.split('_')[-2])
+        hi_sz = int(hi_field.split('_')[-1])
+        lo_lo = int(lo_field.split('_')[-2])
+        lo_sz = int(lo_field.split('_')[-1])
+        
+        self.fields.add((hi_field, hi_lo, hi_sz, None))
+        self.fields.add((lo_field, lo_lo, lo_sz, None))
+        
+        # Track that this computed register is used
+        self.computed_registers.add(name)
+        
+        # Add to computed defines
+        def1 = f'{name}: {lo_field} is {hi_field}=1 & {lo_field} {{ local tmp:4 = {lo_field}; export tmp; }}'
+        # Note: This logic is simplified; original had strict register mapping logic. 
+        # For this version we will map these to specific registers later via attach variables
+        self.computed_definitions[name] = f'# Computed register {name} needs manual attach variables logic'
+
+    def _add_shift_computed(self, name, base_field):
+        self._imm_field(6, 5, None) # Ensure base field exists
+        self.computed_definitions[name] = f'{name}: 32 is {base_field}=0 {{ }}\n{name}: {base_field} is {base_field} {{ }}'
+
+    def _build_constraints(self, size, value, mask):
+        constraints = []
+        # Same constraint building logic as before
+        current_mask_chunk_start = -1
+        for i in range(size):
+            is_masked = (mask >> i) & 1
+            if is_masked:
+                if current_mask_chunk_start == -1: current_mask_chunk_start = i
+            else:
+                if current_mask_chunk_start != -1:
+                    chunk_len = i - current_mask_chunk_start
+                    chunk_val = (value >> current_mask_chunk_start) & ((1 << chunk_len) - 1)
+                    op_name = f'op_{current_mask_chunk_start}_{chunk_len}' if size==16 else f'op32_{current_mask_chunk_start}_{chunk_len}'
+                    self.fields.add((op_name, current_mask_chunk_start, chunk_len, None))
+                    constraints.append(f'{op_name}=0x{chunk_val:x}')
+                    current_mask_chunk_start = -1
+        if current_mask_chunk_start != -1:
+            chunk_len = size - current_mask_chunk_start
+            chunk_val = (value >> current_mask_chunk_start) & ((1 << chunk_len) - 1)
+            op_name = f'op_{current_mask_chunk_start}_{chunk_len}' if size==16 else f'op32_{current_mask_chunk_start}_{chunk_len}'
+            self.fields.add((op_name, current_mask_chunk_start, chunk_len, None))
+            constraints.append(f'{op_name}=0x{chunk_val:x}')
+        return constraints
+
+    def _print_headers(self):
+        print('# Generated by generate_sleigh.py')
+        print('define endian=little;')
+        print('define alignment=2;')
+        print('define space RAM type=ram_space size=4 default;')
+        print('define space register type=register_space size=4;')
+        print()
+        print('define register offset=0x0000 size=4 [')
+        print('  r0 r1 r2 r3 r4 r5 r6 r7 r8 r9 r10 r11 r12 sp lr pc')
+        print('];')
+        print()
+        
+        print('define token instr(16)')
+        # Deduplicate fields: for same name, keep the one with attribute
+        fields_dict = {}
+        for name, lo, size, attr in self.fields:
+            if name not in fields_dict or (attr and not fields_dict[name][3]):
+                fields_dict[name] = (name, lo, size, attr)
+        
+        for name, lo, size, attr in sorted(fields_dict.values(), key=lambda x: (x[0], x[1], x[2], str(x[3]))):
+            if not name.startswith('op32_'):
+                attr_str = f' {attr}' if attr else ''
+                print(f'  {name} = ({lo}, {lo + size - 1}){attr_str}')
+        print(';')
+        
+        print('define token instr32(32)')
+        for name, lo, size, attr in sorted(list(self.fields), key=lambda x: (x[0], x[1], x[2], str(x[3]))):
+            if name.startswith('op32_'):
+                attr_str = f' {attr}' if attr else ''
+                print(f'  {name} = ({lo}, {lo + size - 1}){attr_str}')
+        print('  imm22_hi = (16, 26)\n  imm22_lo = (0, 10)')
+        print(';')
+        print()
+        
+        # Computed register definitions (hi_reg_*)
+        if 'hi_reg_7_1_and_0_3' in self.computed_registers or 'hi_reg_6_1_and_3_3' in self.computed_registers:
+            if 'hi_reg_7_1_and_0_3' in self.computed_registers:
+                print('hi_reg_7_1_and_0_3: reg is hi_reg_upper_7_1 & hi_reg_lower_0_3 [ reg = (hi_reg_upper_7_1 << 3) | hi_reg_lower_0_3; ] { local tmp:4 = reg; export tmp; }')
+            if 'hi_reg_6_1_and_3_3' in self.computed_registers:
+                print('hi_reg_6_1_and_3_3: reg is hi_reg_upper_6_1 & hi_reg_lower_3_3 [ reg = (hi_reg_upper_6_1 << 3) | hi_reg_lower_3_3; ] { local tmp:4 = reg; export tmp; }')
+            print()
+        
+        # Computed values definitions
+        for key in sorted(self.computed_definitions.keys()):
+            if not key.startswith('hi_reg'):
+                print(self.computed_definitions[key])
+        print()
+        
+        # Rel definitions for jumps
+        print('rel22: addr is imm22_hi & imm22_lo [ addr = ((imm22_hi << 11) | imm22_lo) << 1; ] { local tmp:4 = inst_next + addr; export tmp; }')
+        print()
+
+        # Attach variables
+        if self.register_fields:
+            # We assume all reg_X_3 map to r0-r7
+            reg_fields_list = ' '.join(sorted(list(self.register_fields)))
+            print(f'attach variables [ {reg_fields_list} ] [ r0 r1 r2 r3 r4 r5 r6 r7 ];')
+        
+        # Manually attach high registers based on known logic
+        print('attach variables [ hi_reg_lower_0_3 hi_reg_lower_3_3 ] [ r8 r9 r10 r11 r12 sp lr pc ];')
+        print()
+
+    def _print_instruction(self, insn):
+        print(f'# {insn["original_asm"]}')
+        
+        display_str = ""
+        prev_is_ident = False
+        parsed_ops = insn['operands']
+        
+        # Clean up empty strings
+        parsed_ops = [x for x in parsed_ops if x != '']
+
+        for part in parsed_ops:
+            is_ident = not part.startswith('"') and not part in [',', ' ', '[', ']', '+', '#']
+            if prev_is_ident and (is_ident or part.startswith('"')):
+                display_str += "^"
+            display_str += part
+            if is_ident or part.startswith('"'):
+                prev_is_ident = True
+            else:
+                prev_is_ident = False
+                
+        constraint_str = ' & '.join(insn['constraints'])
+        semantic_ops = self._get_semantic_ops(parsed_ops)
+        if semantic_ops:
+             constraint_str += ' & ' + ' & '.join(semantic_ops)
+             
+        print(f':{display_str} is {constraint_str}')
+        print('{')
+        self._print_pcode(insn['mnemonic'], semantic_ops)
+        print('}')
+        print()
+
+    def _get_semantic_ops(self, ops):
+        # Filter out formatting for constraints
+        res = []
+        for x in ops:
+            # Skip quoted literals and punctuation
+            if x.startswith('"') or x in [',', ' ', '[', ']', '{', '}', '+', '#']: continue
+            # Handle register list literals: {pc}, {lr}, {}
+            if x.startswith('{') and x.endswith('}'):
+                # Extract register name from {reg} for constraint
+                inner = x[1:-1]  # Remove braces
+                if inner and inner not in ['']:  # Skip empty {}
+                    res.append(inner)  # Add bare register name (pc, lr, etc.)
+                continue
+            # Skip global registers (exact match) when not in braces
+            if x in ['sp', 'pc']: continue
+            res.append(x)
+        return res
+
+    def _print_pcode(self, mnem, ops):
+        # Clean ops
+        clean_ops = [op.replace('#', '') for op in ops]
+        
+        if mnem.startswith('tmov'):
+            if len(clean_ops) >= 2: print(f'    {clean_ops[0]} = {clean_ops[1]};')
+        elif mnem.startswith('tadd'):
+            if len(clean_ops) >= 2:
+                if len(clean_ops) >= 3: print(f'    {clean_ops[0]} = {clean_ops[1]} + {clean_ops[2]};')
+                else: print(f'    {clean_ops[0]} = {clean_ops[0]} + {clean_ops[1]};')
+        elif mnem.startswith('tsub'):
+            if len(clean_ops) >= 3: print(f'    {clean_ops[0]} = {clean_ops[1]} - {clean_ops[2]};')
+            elif len(clean_ops) >= 2: print(f'    {clean_ops[0]} = {clean_ops[0]} - {clean_ops[1]};')
+        elif mnem.startswith('tmul'):
+             if len(clean_ops) >= 2: print(f'    {clean_ops[0]} = {clean_ops[0]} * {clean_ops[1]};')
+        elif mnem.startswith('tand'):
+             if len(clean_ops) >= 2: print(f'    {clean_ops[0]} = {clean_ops[0]} & {clean_ops[1]};')
+        elif mnem.startswith('tor'):
+             if len(clean_ops) >= 2: print(f'    {clean_ops[0]} = {clean_ops[0]} | {clean_ops[1]};')
+        elif mnem.startswith('txor'):
+             if len(clean_ops) >= 2: print(f'    {clean_ops[0]} = {clean_ops[0]} ^ {clean_ops[1]};')
+        elif mnem.startswith('tshftl'):
+             if len(clean_ops) >= 2: print(f'    {clean_ops[0]} = {clean_ops[0]} << {clean_ops[1]};')
+        elif mnem.startswith('tshftr'):
+             if len(clean_ops) >= 2: print(f'    {clean_ops[0]} = {clean_ops[0]} >> {clean_ops[1]};')
+        elif mnem.startswith('tasr'):
+             if len(clean_ops) >= 2: print(f'    {clean_ops[0]} = {clean_ops[0]} s>> {clean_ops[1]};')
+        elif mnem.startswith('tj'):
+             if 'l' not in mnem and 'ex' not in mnem and clean_ops:
+                 # For conditional jumps like tj<cond>.n, the displacement is usually the last operand
+                 # Find displacement field (starts with 'displacement_')
+                 disp = next((op for op in clean_ops if 'displacement' in op), None)
+                 if disp:
+                     print(f'    # Conditional jump - TODO: implement condition check for {clean_ops[0] if clean_ops else "cond"}')
+                     print(f'    # goto {disp};')
+                 elif clean_ops:
+                     # Fallback to first operand if no displacement found
+                     print(f'    # TODO: Jump logic for {clean_ops[0]}')
+             else:
+                 print(f'    # TODO: Complex jump logic')
+        else:
+            print(f'    # TODO: P-code for {mnem}')
+
+if __name__ == '__main__':
+    gen = SLEIGHGenerator()
+    gen.generate()

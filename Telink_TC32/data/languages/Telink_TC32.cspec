@@ -5,31 +5,38 @@
   </global>
   <stackpointer register="sp" space="RAM"/>
   <default_proto>
-    <!-- FIXME: this is just garbage right now -->
-    <prototype name="__stdcall" extrapop="2" stackshift="2">
+    <prototype name="__stdcall" extrapop="0" stackshift="4">
       <input>
-        <pentry maxsize="2" minsize="1">
+        <pentry maxsize="4" minsize="1">
+          <register name="r0"/>
+        </pentry>
+        <pentry maxsize="4" minsize="1">
           <register name="r1"/>
         </pentry>
-        <pentry maxsize="2" minsize="1">
+        <pentry maxsize="4" minsize="1">
           <register name="r2"/>
         </pentry>
-        <pentry maxsize="2" minsize="1">
+        <pentry maxsize="4" minsize="1">
           <register name="r3"/>
         </pentry>
-        <pentry maxsize="2" minsize="1">
-          <register name="r4"/>
-        </pentry>
-        <pentry maxsize="500" minsize="1" align="2">
-          <addr space="stack" offset="2"/>
+        <pentry maxsize="500" minsize="1" align="4">
+          <addr space="stack" offset="0"/>
         </pentry>
       </input>
       <output>
-        <pentry minsize="1" maxsize="2">
-          <register name="r1"/>
+        <pentry minsize="1" maxsize="4">
+          <register name="r0"/>
         </pentry>
       </output>
       <unaffected>
+        <register name="r4"/>
+        <register name="r5"/>
+        <register name="r6"/>
+        <register name="r7"/>
+        <register name="r8"/>
+        <register name="r9"/>
+        <register name="r10"/>
+        <register name="r11"/>
         <register name="sp"/>
       </unaffected>
     </prototype>
